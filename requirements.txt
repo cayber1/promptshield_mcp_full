@@ -1,0 +1,12 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+scikit-learn>=1.3.0
+numpy>=1.24.0
+joblib>=1.3.0
+# Agentic AI framework (proposal: CrewAI)
+crewai>=0.80.0
+# Embedding-based prompt analysis (proposal: embedding-based)
+sentence-transformers>=2.7.0
+# OpenAI backend (optional, for generator + LLM dataset generation)
+openai>=1.0.0
