@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from config import MOCK_LLM, OPENAI_MODEL
+from config import MOCK_LLM, GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL
 
 
 @dataclass
@@ -56,9 +56,9 @@ def _mock_generate(prompt: str) -> tuple[str, int]:
 def _real_generate(prompt: str, model: str) -> tuple[str, int]:
     try:
         import openai
-        client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        client = openai.OpenAI(api_key=os.environ.get("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1")
         completion = client.chat.completions.create(
-            model=model,
+            model="llama-3.3-70b-versatile",
             messages=[
                 {
                     "role": "system",
@@ -88,7 +88,7 @@ class GeneratorAgent:
 
     name = "GeneratorAgent"
 
-    def __init__(self, mock: bool = MOCK_LLM, model: str = OPENAI_MODEL):
+    def __init__(self, mock: bool = MOCK_LLM, model: str = GROQ_MODEL):
         self._mock = mock
         self._model = "mock" if mock else model
 

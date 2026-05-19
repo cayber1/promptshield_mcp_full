@@ -39,6 +39,10 @@ VAL_RATIO   = 0.15
 TEST_RATIO  = 0.15
 
 # LLM mock mode (set False when using real API)
-MOCK_LLM = True
+MOCK_LLM = False
 
 OPENAI_MODEL = "gpt-4o-mini"   # swap to your key's model
+
+GROQ_API_KEY  = __import__('os').environ.get('GROQ_API_KEY', '')
+GROQ_BASE_URL  = 'https://api.groq.com/openai/v1'
+GROQ_MODEL     = 'llama-3.3-70b-versatile'
