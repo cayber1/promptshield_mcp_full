@@ -12,7 +12,7 @@ CONVERGENCE_THRESHOLD = 0.05
 
 # Feature weights (logistic regression w vector)
 # F(P) = [override, injection, role_manipulation, context_manipulation, ambiguity]
-FEATURE_WEIGHTS = [2.1, 1.8, 1.6, 1.4, 0.9]
+FEATURE_WEIGHTS = [2.1, 1.8, 1.6, 1.4, 0.9, 2.3]  # added tool_coercion weight
 BIAS = -1.2
 
 # Utility metric weights

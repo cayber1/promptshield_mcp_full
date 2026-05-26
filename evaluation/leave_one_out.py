@@ -7,8 +7,8 @@ For each attack category C:
   - Test on category C only (held-out)
   - Report per-category generalization metrics
 
-This tests whether the model can generalize to unseen attack types,
-which is critical for real-world robustness as described in the proposal.
+Uses HYBRID feature extraction (regex + embeddings) as defined in
+utils/feature_extractor.py — consistent with the full pipeline.
 
 Attack categories:
   prompt_injection, instruction_override, role_confusion,
@@ -34,12 +34,11 @@ from config import ATTACK_CATEGORIES
 class PromptSample:
     prompt_id: str
     prompt: str
-    label: int                          # 0 = benign, 1 = adversarial
-    attack_category: Optional[str]      # None for benign
+    label: int
+    attack_category: Optional[str]
 
 
 def load_split(path: str) -> List[PromptSample]:
-    """Loads a JSONL dataset split into PromptSample records."""
     samples = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -68,8 +67,9 @@ class CategoryResult:
     precision: float
     recall: float
     f1: float
-    safety_violation_rate: float        # FN rate on adversarial = missed attacks
-    false_positive_rate: float          # FP rate on benign = over-blocking
+    safety_violation_rate: float
+    false_positive_rate: float
+    feature_mode: str = "hybrid"   # "hybrid" or "regex_only"
 
     def __str__(self) -> str:
         return (
@@ -80,7 +80,8 @@ class CategoryResult:
             f"| R={self.recall:.3f} "
             f"| F1={self.f1:.3f} "
             f"| SVR={self.safety_violation_rate:.3f} "
-            f"| FPR={self.false_positive_rate:.3f}"
+            f"| FPR={self.false_positive_rate:.3f} "
+            f"| feat={self.feature_mode}"
         )
 
 
@@ -93,62 +94,64 @@ class LOACOReport:
     mean_fpr: float
     worst_category: str
     best_category: str
+    feature_mode: str
 
     def __str__(self) -> str:
         lines = [
-            "=" * 80,
+            "=" * 85,
             "Leave-One-Attack-Category-Out (LOACO) Evaluation",
-            "=" * 80,
+            f"Feature mode: {self.feature_mode}",
+            "=" * 85,
         ]
         for r in self.results:
             lines.append(str(r))
         lines += [
             "",
-            f"  Mean Accuracy            : {self.mean_accuracy:.4f}",
-            f"  Mean F1                  : {self.mean_f1:.4f}",
+            f"  Mean Accuracy             : {self.mean_accuracy:.4f}",
+            f"  Mean F1                   : {self.mean_f1:.4f}",
             f"  Mean Safety Violation Rate: {self.mean_svr:.4f}  (lower = better)",
-            f"  Mean False Positive Rate : {self.mean_fpr:.4f}  (lower = better)",
-            f"  Worst generalization     : {self.worst_category}",
-            f"  Best generalization      : {self.best_category}",
-            "=" * 80,
+            f"  Mean False Positive Rate  : {self.mean_fpr:.4f}  (lower = better)",
+            f"  Worst generalization      : {self.worst_category}",
+            f"  Best generalization       : {self.best_category}",
+            "=" * 85,
         ]
         return "\n".join(lines)
 
 
-# ── Scorer wrapper ────────────────────────────────────────────────────────────
+# ── Feature extraction with embedding fallback ────────────────────────────────
 
-def _predict(samples: List[PromptSample], use_embeddings: bool = False) -> List[int]:
+def _extract_features(prompt: str, use_embeddings: bool = True) -> List[float]:
     """
-    Runs the PromptShield risk scorer on a list of samples.
-    Returns binary predictions (0 or 1).
+    Extracts hybrid feature vector (regex + embeddings).
+    Falls back to regex-only if sentence-transformers unavailable.
     """
     from utils.feature_extractor import extract_features
-    from models.risk_scorer import TrainedRiskScorer, AnalyticRiskScorer
-    from config import TAU_1, TAU_2
+    try:
+        return extract_features(prompt, use_embeddings=use_embeddings)
+    except Exception:
+        return extract_features(prompt, use_embeddings=False)
 
-    scorer = TrainedRiskScorer()
-    preds = []
-    for s in samples:
-        features = extract_features(s.prompt, use_embeddings=use_embeddings)
-        _, risk, _ = scorer.decide(s.prompt)
-        preds.append(1 if risk > 0.5 else 0)
-    return preds
 
+def _determine_feature_mode() -> Tuple[bool, str]:
+    """Checks if embeddings are available, returns (use_embeddings, mode_label)."""
+    try:
+        from sentence_transformers import SentenceTransformer
+        return True, "hybrid(regex+embeddings)"
+    except ImportError:
+        return False, "regex_only"
+
+
+# ── Scorer ────────────────────────────────────────────────────────────────────
 
 def _retrain_on_subset(
     train_samples: List[PromptSample],
+    use_embeddings: bool = True,
 ) -> "TrainedRiskScorer":
-    """
-    Retrains the logistic regression scorer on a given training subset.
-    Returns a new fitted scorer instance.
-    """
-    import numpy as np
-    from utils.feature_extractor import extract_features
+    """Retrains logistic regression on leave-out training subset."""
     from models.risk_scorer import TrainedRiskScorer
 
-    X = np.array([extract_features(s.prompt, use_embeddings=False) for s in train_samples])
+    X = np.array([_extract_features(s.prompt, use_embeddings) for s in train_samples])
     y = np.array([s.label for s in train_samples])
-
     scorer = TrainedRiskScorer()
     scorer.train(X, y)
     return scorer
@@ -158,21 +161,18 @@ def _compute_metrics(
     y_true: List[int],
     y_pred: List[int],
 ) -> Tuple[float, float, float, float]:
-    """Returns (accuracy, precision, recall, f1)."""
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
-
     tp = int(np.sum((y_pred == 1) & (y_true == 1)))
     fp = int(np.sum((y_pred == 1) & (y_true == 0)))
     fn = int(np.sum((y_pred == 0) & (y_true == 1)))
     tn = int(np.sum((y_pred == 0) & (y_true == 0)))
     n  = len(y_true)
-
     accuracy  = (tp + tn) / n if n > 0 else 0.0
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1        = (2 * precision * recall / (precision + recall)
-                 if (precision + recall) > 0 else 0.0)
+    f1 = (2 * precision * recall / (precision + recall)
+          if (precision + recall) > 0 else 0.0)
     return accuracy, precision, recall, f1
 
 
@@ -185,23 +185,22 @@ def run_loaco(
     retrain: bool = True,
 ) -> LOACOReport:
     """
-    Runs Leave-One-Attack-Category-Out evaluation.
+    Runs Leave-One-Attack-Category-Out evaluation with hybrid features.
 
     For each category C:
       - Training set: all train_samples whose attack_category != C
-        (benign samples are always included)
-      - Test set: all test_samples whose attack_category == C,
-        plus an equal-size sample of benign test prompts
+        (benign samples always included)
+      - Test set: test_samples with attack_category == C +
+        equal-size benign test sample
 
-    Args:
-        train_samples: Full training split
-        test_samples:  Full test split
-        categories:    Categories to evaluate (default: all in config)
-        retrain:       If True, retrain scorer on each leave-out split.
-                       If False, use the pre-trained scorer (faster).
+    Features: hybrid (regex + sentence-transformer embeddings)
+    Falls back to regex-only if sentence-transformers not installed.
     """
     if categories is None:
         categories = ATTACK_CATEGORIES
+
+    use_embeddings, feature_mode = _determine_feature_mode()
+    print(f"[LOACO] Feature mode: {feature_mode}")
 
     benign_train = [s for s in train_samples if s.label == 0]
     benign_test  = [s for s in test_samples  if s.label == 0]
@@ -211,7 +210,6 @@ def run_loaco(
     for held_out in categories:
         print(f"\n[LOACO] Holding out: '{held_out}'")
 
-        # ── Build leave-out training set ──────────────────────────────────
         adv_train = [
             s for s in train_samples
             if s.label == 1 and s.attack_category != held_out
@@ -219,42 +217,36 @@ def run_loaco(
         lo_train = adv_train + benign_train
         np.random.shuffle(lo_train)
 
-        # ── Build test set (held-out category only) ───────────────────────
         adv_test = [s for s in test_samples if s.attack_category == held_out]
-        # Balance with benign
         n_benign_test = min(len(adv_test), len(benign_test))
-        ben_test_subset = list(np.random.choice(benign_test, n_benign_test, replace=False))  # type: ignore
+        ben_test_subset = list(
+            np.random.choice(benign_test, n_benign_test, replace=False)  # type: ignore
+        )
         lo_test = adv_test + list(ben_test_subset)
 
         if len(adv_test) == 0:
-            print(f"  [SKIP] No test samples for category '{held_out}'")
+            print(f"  [SKIP] No test samples for '{held_out}'")
             continue
 
-        # ── (Re)train ─────────────────────────────────────────────────────
         if retrain and len(lo_train) >= 10:
-            print(f"  Retraining on {len(lo_train)} samples (excluding '{held_out}')...")
-            scorer = _retrain_on_subset(lo_train)
+            print(f"  Retraining on {len(lo_train)} samples with {feature_mode} features...")
+            scorer = _retrain_on_subset(lo_train, use_embeddings=use_embeddings)
         else:
-            print(f"  Using pre-trained scorer (retrain=False or insufficient data).")
             from models.risk_scorer import TrainedRiskScorer
             scorer = TrainedRiskScorer()
 
-        # ── Predict ───────────────────────────────────────────────────────
         y_true, y_pred = [], []
         for s in lo_test:
             _, risk, _ = scorer.decide(s.prompt)
-            pred = 1 if risk > 0.5 else 0
             y_true.append(s.label)
-            y_pred.append(pred)
+            y_pred.append(1 if risk > 0.5 else 0)
 
         acc, prec, rec, f1 = _compute_metrics(y_true, y_pred)
 
-        # Safety Violation Rate = FN / actual positives (missed attacks)
-        adv_true  = [y for y, s in zip(y_true, lo_test) if s.label == 1]
-        adv_pred  = [p for p, s in zip(y_pred, lo_test) if s.label == 1]
+        adv_true = [y for y, s in zip(y_true, lo_test) if s.label == 1]
+        adv_pred = [p for p, s in zip(y_pred, lo_test) if s.label == 1]
         svr = sum(1 for t, p in zip(adv_true, adv_pred) if t == 1 and p == 0) / max(len(adv_true), 1)
 
-        # False Positive Rate = FP / actual negatives (over-blocking benign)
         ben_true = [y for y, s in zip(y_true, lo_test) if s.label == 0]
         ben_pred = [p for p, s in zip(y_pred, lo_test) if s.label == 0]
         fpr = sum(1 for t, p in zip(ben_true, ben_pred) if t == 0 and p == 1) / max(len(ben_true), 1)
@@ -270,11 +262,11 @@ def run_loaco(
             f1=round(f1, 4),
             safety_violation_rate=round(svr, 4),
             false_positive_rate=round(fpr, 4),
+            feature_mode=feature_mode,
         )
         results.append(result)
-        print(f"  Done. Acc={acc:.3f}, F1={f1:.3f}, SVR={svr:.3f}")
+        print(f"  Done. Acc={acc:.3f}, F1={f1:.3f}, SVR={svr:.3f}, FPR={fpr:.3f}")
 
-    # ── Aggregate ─────────────────────────────────────────────────────────────
     mean_acc = float(np.mean([r.accuracy for r in results]))
     mean_f1  = float(np.mean([r.f1 for r in results]))
     mean_svr = float(np.mean([r.safety_violation_rate for r in results]))
@@ -290,12 +282,13 @@ def run_loaco(
         mean_fpr=round(mean_fpr, 4),
         worst_category=worst,
         best_category=best,
+        feature_mode=feature_mode,
     )
 
 
 def save_loaco_report(report: LOACOReport, path: str):
-    """Saves LOACO report to JSON."""
     data = {
+        "feature_mode": report.feature_mode,
         "mean_accuracy": report.mean_accuracy,
         "mean_f1": report.mean_f1,
         "mean_safety_violation_rate": report.mean_svr,
@@ -314,6 +307,7 @@ def save_loaco_report(report: LOACOReport, path: str):
                 "f1": r.f1,
                 "safety_violation_rate": r.safety_violation_rate,
                 "false_positive_rate": r.false_positive_rate,
+                "feature_mode": r.feature_mode,
             }
             for r in report.results
         ],
@@ -332,6 +326,7 @@ if __name__ == "__main__":
 
     if not train_path.exists() or not test_path.exists():
         print(f"[ERROR] Dataset splits not found in {data_dir}")
+        print("Run: python dataset/dataset_builder.py first")
         sys.exit(1)
 
     print("[LOACO] Loading dataset splits...")

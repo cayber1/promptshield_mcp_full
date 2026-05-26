@@ -1,17 +1,22 @@
 """
 dataset/dataset_builder.py
 PromptShieldBench — adversarial prompt benchmark dataset.
-Approximately 2400 prompts, balanced benign / adversarial.
+Approximately 2400+ prompts, balanced benign / adversarial.
 Attack categories:
   prompt_injection, instruction_override, role_confusion,
   context_manipulation, policy_bypass, tool_coercion
+
+Changes vs original:
+  - Integrates public dataset (public_dataset_loader.py)
+  - Semantic clustering split: near-duplicates stay in same split
+    (prevents data leakage across train/val/test)
 """
 
 import json
 import random
 import hashlib
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 
 from config import ATTACK_CATEGORIES, TRAIN_RATIO, VAL_RATIO, TEST_RATIO
@@ -149,7 +154,6 @@ def _generate_adversarial_prompts() -> List[PromptRecord]:
     for category, templates in category_templates.items():
         for _ in range(per_category):
             base = random.choice(templates)
-            # Add minor perturbations for variety
             perturbations = [
                 base,
                 base + " Please comply.",
@@ -170,31 +174,193 @@ def _generate_adversarial_prompts() -> List[PromptRecord]:
     return records
 
 
+# ── Semantic clustering split ─────────────────────────────────────────────────
+
+def _jaccard_similarity(text_a: str, text_b: str) -> float:
+    """Character n-gram Jaccard similarity (fast, no dependencies)."""
+    n = 4
+    def ngrams(t):
+        t = t.lower()
+        return set(t[i:i+n] for i in range(len(t) - n + 1))
+    a, b = ngrams(text_a), ngrams(text_b)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _cluster_records(
+    records: List[PromptRecord],
+    similarity_threshold: float = 0.7,
+) -> List[List[int]]:
+    """
+    Groups record indices into clusters where any two prompts within a cluster
+    have Jaccard similarity >= threshold. Uses greedy single-linkage clustering.
+
+    Near-duplicates end up in the same cluster → same split, preventing leakage.
+    Only applied to template-generated records (public/llm records are diverse enough).
+    """
+    n = len(records)
+    cluster_id = list(range(n))  # each record starts in its own cluster
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Only cluster within same label + category to avoid over-merging
+            if records[i].label != records[j].label:
+                continue
+            if records[i].attack_category != records[j].attack_category:
+                continue
+            sim = _jaccard_similarity(records[i].prompt, records[j].prompt)
+            if sim >= similarity_threshold:
+                # Merge j's cluster into i's cluster
+                old_id = cluster_id[j]
+                new_id = cluster_id[i]
+                for k in range(n):
+                    if cluster_id[k] == old_id:
+                        cluster_id[k] = new_id
+
+    # Build cluster groups
+    from collections import defaultdict
+    groups: Dict[int, List[int]] = defaultdict(list)
+    for idx, cid in enumerate(cluster_id):
+        groups[cid].append(idx)
+    return list(groups.values())
+
+
+def _semantic_cluster_split(
+    records: List[PromptRecord],
+    train_ratio: float = TRAIN_RATIO,
+    val_ratio: float = VAL_RATIO,
+    seed: int = 42,
+    similarity_threshold: float = 0.7,
+) -> Tuple[List[PromptRecord], List[PromptRecord], List[PromptRecord]]:
+    """
+    Splits records into train/val/test ensuring near-duplicate prompts
+    (Jaccard similarity >= threshold) always land in the same split.
+
+    This prevents data leakage where near-identical adversarial prompts
+    appear in both training and test sets.
+
+    Algorithm:
+      1. Cluster records by n-gram similarity within same label+category
+      2. Shuffle clusters (not individual records)
+      3. Assign whole clusters to splits respecting ratio targets
+    """
+    rng = random.Random(seed)
+
+    # Only cluster template records; public/llm records stay as-is
+    template_records = [r for r in records if r.source == "template"]
+    other_records = [r for r in records if r.source != "template"]
+
+    print(f"[SemanticSplit] Clustering {len(template_records)} template records "
+          f"(threshold={similarity_threshold})...")
+
+    clusters = _cluster_records(template_records, similarity_threshold)
+    rng.shuffle(clusters)
+
+    n_total = len(template_records)
+    n_train_target = int(n_total * train_ratio)
+    n_val_target = int(n_total * val_ratio)
+
+    train_idx, val_idx, test_idx = [], [], []
+    for cluster in clusters:
+        if len(train_idx) < n_train_target:
+            train_idx.extend(cluster)
+        elif len(val_idx) < n_val_target:
+            val_idx.extend(cluster)
+        else:
+            test_idx.extend(cluster)
+
+    train_tmpl = [template_records[i] for i in train_idx]
+    val_tmpl   = [template_records[i] for i in val_idx]
+    test_tmpl  = [template_records[i] for i in test_idx]
+
+    # Split other (public/llm) records proportionally
+    rng.shuffle(other_records)
+    n_other = len(other_records)
+    o_train = int(n_other * train_ratio)
+    o_val   = int(n_other * val_ratio)
+    train_other = other_records[:o_train]
+    val_other   = other_records[o_train:o_train + o_val]
+    test_other  = other_records[o_train + o_val:]
+
+    # Combine and shuffle each split
+    train = train_tmpl + train_other
+    val   = val_tmpl   + val_other
+    test  = test_tmpl  + test_other
+    rng.shuffle(train)
+    rng.shuffle(val)
+    rng.shuffle(test)
+
+    print(f"[SemanticSplit] Clusters formed: {len(clusters)}")
+    print(f"[SemanticSplit] Split sizes — train={len(train)}, val={len(val)}, test={len(test)}")
+
+    return train, val, test
+
+
 # ── Dataset builder ───────────────────────────────────────────────────────────
 
 class PromptShieldBench:
     """
     Builds, splits, and saves the benchmark dataset.
-    Total: ~2400 prompts (1200 benign + 1200 adversarial)
-    Split: 70/15/15
+    Total: ~2400+ prompts (template + public jailbreak datasets)
+    Split: 70/15/15 with semantic clustering to prevent data leakage
     """
 
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, include_public: bool = True):
         random.seed(seed)
+        self._seed = seed
+        self._include_public = include_public
         self._records: List[PromptRecord] = []
 
     def build(self) -> "PromptShieldBench":
+        print("[PromptShieldBench] Building dataset...")
         benign = _generate_benign_prompts()
         adversarial = _generate_adversarial_prompts()
         self._records = benign + adversarial
+
+        if self._include_public:
+            try:
+                from dataset.public_dataset_loader import load_public_dataset
+                public_records_raw = load_public_dataset(max_per_source=200)
+                # Convert to PromptRecord if needed (same dataclass structure)
+                public = []
+                for r in public_records_raw:
+                    public.append(PromptRecord(
+                        id=r.id, prompt=r.prompt, label=r.label,
+                        attack_category=r.attack_category, source=r.source,
+                    ))
+                # Deduplicate against existing records
+                existing_ids = {r.id for r in self._records}
+                new_public = [r for r in public if r.id not in existing_ids]
+                self._records += new_public
+                print(f"[PromptShieldBench] Added {len(new_public)} public records")
+            except Exception as e:
+                print(f"[PromptShieldBench] Public dataset skipped: {e}")
+
         random.shuffle(self._records)
         print(f"[PromptShieldBench] Built {len(self._records)} records "
               f"({sum(r.label==0 for r in self._records)} benign, "
               f"{sum(r.label==1 for r in self._records)} adversarial)")
         return self
 
-    def split(self) -> tuple[List[PromptRecord], List[PromptRecord], List[PromptRecord]]:
-        """Returns (train, val, test)."""
+    def split(
+        self,
+        use_semantic_clustering: bool = True,
+    ) -> Tuple[List[PromptRecord], List[PromptRecord], List[PromptRecord]]:
+        """
+        Returns (train, val, test).
+
+        If use_semantic_clustering=True (default), near-duplicate prompts
+        are guaranteed to be in the same split (prevents data leakage).
+        """
+        if use_semantic_clustering:
+            return _semantic_cluster_split(
+                self._records,
+                train_ratio=TRAIN_RATIO,
+                val_ratio=VAL_RATIO,
+                seed=self._seed,
+            )
+        # Fallback: simple random split
         n = len(self._records)
         n_train = int(n * TRAIN_RATIO)
         n_val   = int(n * VAL_RATIO)
@@ -231,18 +397,21 @@ class PromptShieldBench:
         benign = sum(r.label == 0 for r in self._records)
         adv = sum(r.label == 1 for r in self._records)
         by_cat: Dict[str, int] = {}
+        by_source: Dict[str, int] = {}
         for r in self._records:
             if r.attack_category:
                 by_cat[r.attack_category] = by_cat.get(r.attack_category, 0) + 1
+            by_source[r.source] = by_source.get(r.source, 0) + 1
         return {
             "total": total,
             "benign": benign,
             "adversarial": adv,
             "by_category": by_cat,
+            "by_source": by_source,
         }
 
 
 if __name__ == "__main__":
-    bench = PromptShieldBench().build()
+    bench = PromptShieldBench(include_public=True).build()
     print(bench.stats())
     bench.save()
